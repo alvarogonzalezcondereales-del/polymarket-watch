@@ -1,0 +1,29 @@
+name: Polymarket Watch 24/7
+
+on:
+  schedule:
+    # Cada 30 minutos — ajustá la frecuencia si querés
+    - cron: '*/30 * * * *'
+  workflow_dispatch:  # Podés correrlo manual desde GitHub Actions tab
+  push:
+    branches: [main]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Polymarket scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '8934957659' }}
+          TRENDING_LIMIT: '5'
+        run: python polymarket_watch.py
