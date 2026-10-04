@@ -8,6 +8,8 @@ GitHub Secrets necesarios:
   TELEGRAM_CHAT_ID    (opcional, default 8934957659)
 """
 
+import html
+from html.parser import HTMLParser
 import json
 import os
 import sys
@@ -38,6 +40,121 @@ def api_get(url, timeout=10):
         return {"error": str(e)}
 
 
+def parse_clob_token_ids(value):
+    """Decode and validate Gamma's clobTokenIds value."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+
+    if not isinstance(value, list):
+        return []
+
+    tokens = []
+    for token in value:
+        if not isinstance(token, str) or not token.strip():
+            return []
+        tokens.append(token.strip())
+    return tokens
+
+
+def escape_html_text(value):
+    """Escape untrusted text inserted into Telegram HTML text nodes."""
+    return html.escape(str(value), quote=False)
+
+
+def _telegram_text_units(value):
+    return len(value.encode("utf-16-le", errors="replace")) // 2
+
+
+class _TelegramHTMLLength(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.length = 0
+
+    def handle_data(self, data):
+        self.length += _telegram_text_units(data)
+
+    def handle_entityref(self, name):
+        self.length += _telegram_text_units(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name):
+        self.length += _telegram_text_units(html.unescape(f"&#{name};"))
+
+
+class _TelegramHTMLTruncator(HTMLParser):
+    def __init__(self, text_limit, suffix):
+        super().__init__(convert_charrefs=False)
+        self.text_limit = text_limit
+        self.suffix = suffix
+        self.length = 0
+        self.output = []
+        self.open_tags = []
+        self.truncated = False
+
+    def _finish_truncated(self):
+        self.output.append(self.suffix)
+        self.output.extend(f"</{tag}>" for tag in reversed(self.open_tags))
+        self.truncated = True
+
+    def handle_data(self, data):
+        if self.truncated:
+            return
+        for character in data:
+            units = _telegram_text_units(character)
+            if self.length + units > self.text_limit:
+                self._finish_truncated()
+                return
+            self.output.append(character)
+            self.length += units
+
+    def _handle_entity(self, source, decoded):
+        if self.truncated:
+            return
+        units = _telegram_text_units(decoded)
+        if self.length + units > self.text_limit:
+            self._finish_truncated()
+            return
+        self.output.append(source)
+        self.length += units
+
+    def handle_entityref(self, name):
+        source = f"&{name};"
+        self._handle_entity(source, html.unescape(source))
+
+    def handle_charref(self, name):
+        source = f"&#{name};"
+        self._handle_entity(source, html.unescape(source))
+
+    def handle_starttag(self, tag, attrs):
+        if not self.truncated:
+            self.output.append(self.get_starttag_text())
+            self.open_tags.append(tag)
+
+    def handle_endtag(self, tag):
+        if self.truncated:
+            return
+        self.output.append(f"</{tag}>")
+        if self.open_tags and self.open_tags[-1] == tag:
+            self.open_tags.pop()
+
+
+def truncate_telegram_html(message, max_chars=4000):
+    """Truncate generated HTML by parsed text length without splitting markup."""
+    counter = _TelegramHTMLLength()
+    counter.feed(message)
+    counter.close()
+    if counter.length <= max_chars:
+        return message
+
+    suffix = "..." if max_chars >= 3 else "." * max_chars
+    truncator = _TelegramHTMLTruncator(max_chars - len(suffix), suffix)
+    truncator.feed(message)
+    truncator.close()
+    return "".join(truncator.output)
+
+
 def get_trending(limit=5):
     """Trae eventos trending de Gamma API (sin auth)."""
     return api_get(
@@ -53,11 +170,14 @@ def get_prices_batch(tokens):
     """
     prices = {}
     for tid in tokens:
+        query = urllib.parse.urlencode({"token_id": tid})
         data = api_get(
-            f"https://clob.polymarket.com/last-trade-price?token_id={tid}",
+            f"https://clob.polymarket.com/last-trade-price?{query}",
             timeout=6,
         )
-        if isinstance(data, dict) and "price" in data:
+        if (isinstance(data, dict)
+                and isinstance(data.get("price"), str)
+                and data.get("side") in ("BUY", "SELL")):
             prices[tid] = data["price"]
         else:
             prices[tid] = None
@@ -95,15 +215,19 @@ def main():
     trending = get_trending(LIMIT)
 
     if isinstance(trending, dict) and "error" in trending:
-        msg = f"⚠️ <b>Polymarket — API Error</b>\n{trending['error']}"
+        msg = (f"⚠️ <b>Polymarket — API Error</b>\n"
+               f"{escape_html_text(trending['error'])}")
         telegram_send(msg)
         print(msg)
         sys.exit(1)
 
     if not isinstance(trending, list) or len(trending) == 0:
         msg = "📊 <b>Polymarket</b>: Sin eventos trending ahora."
-        telegram_send(msg)
+        sent = telegram_send(msg)
         print(msg)
+        if not sent:
+            print("[ERROR] No se pudo entregar el mensaje a Telegram.")
+            sys.exit(1)
         return
 
     lines = [
@@ -111,43 +235,45 @@ def main():
     ]
 
     for i, ev in enumerate(trending[:LIMIT], 1):
-        title = ev.get("title", "Evento")[:80]
+        title = str(ev.get("title") or "Evento")[:80]
         slug = ev.get("slug", "")
         volume = ev.get("volume", 0)
-        try:
-            vol_fmt = f"${float(volume):,.0f}"
-        except (ValueError, TypeError):
-            vol_fmt = str(volume)
+        if volume is None:
+            vol_fmt = "—"
+        else:
+            try:
+                vol_fmt = f"${float(volume):,.0f}"
+            except (ValueError, TypeError):
+                vol_fmt = str(volume)
 
-        lines.append(f"{i}. <b>{title}</b>")
+        lines.append(f"{i}. <b>{escape_html_text(title)}</b>")
         if slug:
-            lines.append(f"   polymarket.com/event/{slug}")
-        lines.append(f"   Vol: {vol_fmt}")
+            lines.append(f"   polymarket.com/event/{escape_html_text(slug)}")
+        lines.append(f"   Vol: {escape_html_text(vol_fmt)}")
 
         # Solo el primer mercado para no hacer mil requests por evento
         markets = ev.get("markets", [])
         if markets:
             m = markets[0]
-            q = (m.get("question") or "")[:60]
-            tokens = m.get("clobTokenIds", [])
+            q = str(m.get("question") or "")[:60]
+            tokens = parse_clob_token_ids(m.get("clobTokenIds", []))
             prices = get_prices_batch(tokens[:2])
             price_parts = []
             labels = ["Sí", "No"]
             for j, tid in enumerate(tokens[:2]):
                 p = prices.get(tid)
                 label = labels[j] if j < len(labels) else f"#{j}"
-                price_parts.append(f"{label}: ${p}" if p else f"{label}: —")
+                price_parts.append(
+                    f"{label}: ${escape_html_text(p)}" if p else f"{label}: —"
+                )
             if q:
-                lines.append(f"   📌 {q}")
+                lines.append(f"   📌 {escape_html_text(q)}")
             if price_parts:
                 lines.append(f"      {' | '.join(price_parts)}")
 
         lines.append("")
 
-    msg = "\n".join(lines)
-
-    if len(msg) > 4000:
-        msg = msg[:3997] + "..."
+    msg = truncate_telegram_html("\n".join(lines))
 
     sent = telegram_send(msg)
     if sent:
@@ -156,6 +282,7 @@ def main():
     else:
         print("[FALLBACK] No se pudo enviar a Telegram. Mensaje:")
         print(msg[:1000])
+        sys.exit(1)
 
 
 if __name__ == "__main__":
