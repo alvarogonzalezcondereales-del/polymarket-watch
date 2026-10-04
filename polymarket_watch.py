@@ -8,6 +8,7 @@ GitHub Secrets necesarios:
   TELEGRAM_CHAT_ID    (opcional, default 8934957659)
 """
 
+import html
 import json
 import os
 import sys
@@ -38,6 +39,30 @@ def api_get(url, timeout=10):
         return {"error": str(e)}
 
 
+def parse_clob_token_ids(value):
+    """Decode and validate Gamma's clobTokenIds value."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+
+    if not isinstance(value, list):
+        return []
+
+    tokens = []
+    for token in value:
+        if not isinstance(token, str) or not token.strip():
+            return []
+        tokens.append(token.strip())
+    return tokens
+
+
+def escape_html_text(value):
+    """Escape untrusted text inserted into Telegram HTML text nodes."""
+    return html.escape(str(value), quote=False)
+
+
 def get_trending(limit=5):
     """Trae eventos trending de Gamma API (sin auth)."""
     return api_get(
@@ -53,8 +78,9 @@ def get_prices_batch(tokens):
     """
     prices = {}
     for tid in tokens:
+        query = urllib.parse.urlencode({"token_id": tid})
         data = api_get(
-            f"https://clob.polymarket.com/last-trade-price?token_id={tid}",
+            f"https://clob.polymarket.com/last-trade-price?{query}",
             timeout=6,
         )
         if isinstance(data, dict) and "price" in data:
@@ -95,15 +121,19 @@ def main():
     trending = get_trending(LIMIT)
 
     if isinstance(trending, dict) and "error" in trending:
-        msg = f"⚠️ <b>Polymarket — API Error</b>\n{trending['error']}"
+        msg = (f"⚠️ <b>Polymarket — API Error</b>\n"
+               f"{escape_html_text(trending['error'])}")
         telegram_send(msg)
         print(msg)
         sys.exit(1)
 
     if not isinstance(trending, list) or len(trending) == 0:
         msg = "📊 <b>Polymarket</b>: Sin eventos trending ahora."
-        telegram_send(msg)
+        sent = telegram_send(msg)
         print(msg)
+        if not sent:
+            print("[ERROR] No se pudo entregar el mensaje a Telegram.")
+            sys.exit(1)
         return
 
     lines = [
@@ -119,26 +149,28 @@ def main():
         except (ValueError, TypeError):
             vol_fmt = str(volume)
 
-        lines.append(f"{i}. <b>{title}</b>")
+        lines.append(f"{i}. <b>{escape_html_text(title)}</b>")
         if slug:
-            lines.append(f"   polymarket.com/event/{slug}")
-        lines.append(f"   Vol: {vol_fmt}")
+            lines.append(f"   polymarket.com/event/{escape_html_text(slug)}")
+        lines.append(f"   Vol: {escape_html_text(vol_fmt)}")
 
         # Solo el primer mercado para no hacer mil requests por evento
         markets = ev.get("markets", [])
         if markets:
             m = markets[0]
             q = (m.get("question") or "")[:60]
-            tokens = m.get("clobTokenIds", [])
+            tokens = parse_clob_token_ids(m.get("clobTokenIds", []))
             prices = get_prices_batch(tokens[:2])
             price_parts = []
             labels = ["Sí", "No"]
             for j, tid in enumerate(tokens[:2]):
                 p = prices.get(tid)
                 label = labels[j] if j < len(labels) else f"#{j}"
-                price_parts.append(f"{label}: ${p}" if p else f"{label}: —")
+                price_parts.append(
+                    f"{label}: ${escape_html_text(p)}" if p else f"{label}: —"
+                )
             if q:
-                lines.append(f"   📌 {q}")
+                lines.append(f"   📌 {escape_html_text(q)}")
             if price_parts:
                 lines.append(f"      {' | '.join(price_parts)}")
 
@@ -156,6 +188,7 @@ def main():
     else:
         print("[FALLBACK] No se pudo enviar a Telegram. Mensaje:")
         print(msg[:1000])
+        sys.exit(1)
 
 
 if __name__ == "__main__":
